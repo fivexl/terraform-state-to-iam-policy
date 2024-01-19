@@ -1,6 +1,6 @@
-
 #!/usr/bin/env python3
 
+import sys
 import json
 import argparse
 import logging
@@ -8,8 +8,67 @@ import boto3
 
 ignore_list = [
     'aws_iam_policy_document',
-    'aws_caller_identity'
+    'aws_caller_identity',
+    'aws_region',
+    'aws_canonical_user_id',
+    'aws_partition',
 ]
+
+ignore_replace_list_actions = {
+    "appmesh:GetMesh*": None,
+    "appautoscaling:*Policy*": "autoscaling:*Policy*",
+    "appautoscaling:*Target*": "autoscaling:*Target*",
+    "ecs:GetCluster*": None,
+    "s3:DescribeBucket*": None,
+    "secretsmanager:GetSecretVersion*": "secretsmanager:GetSecretValue",
+    "secretsmanager:DescribeSecretVersion*": None,
+    "vpc:Get*": "ec2:Get*",
+    "vpc:List*": "ec2:List*",
+    "vpc:Describe*": "ec2:Describe*",
+    "vpc:GetEndpoint*": None,
+    "vpc:ListEndpoint*": None,
+    "vpc:DescribeEndpoint*": "ec2:DescribeVpcEndpoint*",
+    "security:GetGroup*": "ec2:GetSecurityGroup*",
+    "security:ListGroup*": None,
+    "security:DescribeGroup*": "ec2:DescribeSecurityGroup*",
+    "security:*Group*": "ec2:*SecurityGroup*",
+    "subnet:Get*": None,
+    "subnet:List*": None,
+    "subnet:Describe*": "ec2:DescribeSubnets",
+    "subnets:Get*": None,
+    "subnets:List*": None,
+    "subnets:Describe*": "ec2:DescribeSubnets",
+    "service:GetDiscoveryDnsNamespace*": "servicediscovery:Get*",
+    "service:ListDiscoveryDnsNamespace*": "servicediscovery:List*",
+    "service:DescribeDiscoveryDnsNamespace*": None,
+    "service:*DiscoveryService*": "servicediscovery:*",  # need to investigate
+    "iam:DescribeRole*": None,
+    "elasticsearch:GetDomain*": None,
+    "elasticsearch:ListDomain*": None,
+    "elasticsearch:DescribeDomain*": "es:DescribeElasticsearchDomain*",
+    "kms:GetAlias*": None,
+    "kms:DescribeAlias*": None,
+    "sns:DescribeTopic*": None,
+    "ssm:ListParameter*": None,
+    "cloudwatch:*LogGroup*": "logs:*LogGroup*",
+    "cloudwatch:*LogStream*": "logs:*LogStream*",
+    "kinesis:*FirehoseDeliveryStream*": "firehose:*DeliveryStream*",
+    "s3:ListObject*": None,
+    "s3:DescribeObject*": None,
+    "s3:*BucketEncryption*": "s3:*EncryptionConfiguration*",
+    "s3:*BucketServerSideEncryptionConfiguration*": "s3:*BucketEncryption*",
+    "s3:*BucketLifecycleConfiguration*": "s3:*LifecycleConfiguration*",
+    "iam:*RolePolicyAttachment*": "iam:*RolePolic*",
+}
+
+
+def check_action_candidate(action_candidate):
+    if action_candidate not in ignore_replace_list_actions.keys():
+        return action_candidate
+    elif ignore_replace_list_actions[action_candidate] is not None:
+        return ignore_replace_list_actions[action_candidate]
+    else:
+        return None
 
 
 def get_policy_document(statements):
@@ -22,10 +81,14 @@ def get_policy_document(statements):
 def validate_statement(logger, client, statement):
     policy_document = get_policy_document([statement])
     try:
-        client.validate_policy(
+        findings = client.validate_policy(
             policyDocument=policy_document,
             policyType='IDENTITY_POLICY'
         )
+        if len(findings['findings']) > 0:
+            logger.error(
+                f"Invalid policy statement:\n{policy_document}\n{json.dumps(findings['findings'], indent=4)}")
+            # sys.exit(1)
     except Exception as e:
         logger.error(
             f"Invalid policy statement:\n{policy_document}")
@@ -37,19 +100,37 @@ def prepare_policy_statement(logger, type, service, resource, arns):
     if len(arns) == 0:
         arns = "*"
 
-    action = [f"{service}:*{resource}*"]
+    action = []
     if type == 'data':
-        action = [
-            f"{service}:Get{resource}*",
-            f"{service}:List{resource}*",
-            f"{service}:Describe{resource}*",
-        ]
+        for verb in ['Get', 'List', 'Describe']:
+            action_candidate = check_action_candidate(
+                f"{service}:{verb}{resource}*")
+            if action_candidate is not None:
+                action.append(action_candidate)
+    else:
+        action_candidate = check_action_candidate(f"{service}:*{resource}*")
+        action.append(action_candidate)
 
     return {
         "Sid": f"Allow{service.capitalize()}{resource}",
         "Action": action,
         "Effect": "Allow",
         "Resource": arns
+    }
+
+
+def prepare_wildcard_policy_statement(sid, actions):
+
+    approved_actions = []
+    for action in actions:
+        if check_action_candidate(action) is not None:
+            approved_actions.append(check_action_candidate(action))
+
+    return {
+        "Sid": sid,
+        "Action": approved_actions,
+        "Effect": "Allow",
+        "Resource": "*"
     }
 
 
@@ -108,7 +189,26 @@ def parse_state_file(logger, state_file, ignore_list):
     logger.debug(f'Data Sources: {json.dumps(data_sources, indent=4)}')
     logger.debug(f'Resources: {json.dumps(resources, indent=4)}')
 
-    return data_sources, resources
+    wildcard_data_sources = {}
+    wildcard_resources = {}
+    scoped_data_sources = {}
+    scoped_resources = {}
+
+    for data_source in data_sources.keys():
+        if len(data_sources[data_source]) == 0:
+            wildcard_data_sources[data_source] = data_sources[data_source]
+        else:
+            # dedupe
+            scoped_data_sources[data_source] = list(
+                set(data_sources[data_source]))
+    for resource in resources.keys():
+        if len(resources[resource]) == 0:
+            wildcard_resources[resource] = resources[resource]
+        else:
+            # dedupe
+            scoped_resources[resource] = list(set(resources[resource]))
+
+    return wildcard_data_sources, scoped_data_sources, wildcard_resources, scoped_resources
 
 
 def main():
@@ -123,24 +223,47 @@ def main():
     with open(args.state_file) as f:
         data = json.load(f)
 
-    data_sources, resources = parse_state_file(logger, data, ignore_list)
+    wildcard_data_sources, scoped_data_sources, wildcard_resources, scoped_resources = parse_state_file(
+        logger, data, ignore_list
+    )
 
     client = boto3.client('accessanalyzer')
     policy_statements = []
-    for data_source in data_sources.keys():
+    for data_source in scoped_data_sources.keys():
         service, resource_name = parse_resource_name(data_source)
         statement = prepare_policy_statement(
-            logger, 'data', service, resource_name, data_sources[data_source]
+            logger, 'data', service, resource_name, scoped_data_sources[data_source]
         )
         validate_statement(logger, client, statement)
         policy_statements.append(statement)
-    for resource in resources.keys():
+    for resource in scoped_resources.keys():
         service, resource_name = parse_resource_name(resource)
         statement = prepare_policy_statement(
-            logger, 'resource', service, resource_name, resources[resource]
+            logger, 'resource', service, resource_name, scoped_resources[resource]
         )
         validate_statement(logger, client, statement)
         policy_statements.append(statement)
+
+    wildcard_read_actions = list()
+    for wildcard_data_source in wildcard_data_sources.keys():
+        service, resource_name = parse_resource_name(wildcard_data_source)
+        wildcard_read_actions.append(f"{service}:List{resource_name}*")
+        wildcard_read_actions.append(f"{service}:Get{resource_name}*")
+        wildcard_read_actions.append(f"{service}:Describe{resource_name}*")
+    statement = prepare_wildcard_policy_statement(
+        "AllowWildCardRead", wildcard_read_actions)
+    validate_statement(logger, client, statement)
+    policy_statements.append(statement)
+
+    wildcard_manage_actions = list()
+    for wildcard_resource in wildcard_resources.keys():
+        service, resource_name = parse_resource_name(wildcard_resource)
+        wildcard_manage_actions.append(f"{service}:*{resource_name}*")
+    statement = prepare_wildcard_policy_statement(
+        "AllowWildCardManage", wildcard_manage_actions)
+    validate_statement(logger, client, statement)
+    policy_statements.append(statement)
+
     print(get_policy_document(policy_statements))
 
 
